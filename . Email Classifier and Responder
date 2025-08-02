@@ -1,0 +1,156 @@
+"⚠️ Note: API keys and credentials have been removed for security reasons. Please add your own credentials to run this project."
+
+
+pip install --upgrade openai google-auth google-auth-oauthlib google-api-python-client gradio
+
+import os
+import pickle
+import base64
+from email.mime.text import MIMEText
+
+from google.auth.transport.requests import Request
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+
+from openai import OpenAI
+import gradio as gr
+
+# ===================== 🔐 Gmail Auth ======================
+SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
+CREDENTIALS_FILE = 'client_secret_YOUR_FILE.json'  # Replace this with your actual file name
+
+def authenticate_gmail():
+    creds = None
+    if os.path.exists('token.pickle'):
+        with open('token.pickle', 'rb') as token:
+            creds = pickle.load(token)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open('token.pickle', 'wb') as token:
+            pickle.dump(creds, token)
+
+    return build('gmail', 'v1', credentials=creds)
+
+# ===================== 🤖 OpenAI Setup ======================
+client = OpenAI(api_key="sk-...")  # 🔑 Replace with your OpenAI API Key
+
+def generate_gpt_reply(prompt):
+    try:
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a professional email assistant. Reply clearly and concisely."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"❌ OpenAI Error: {e}"
+
+# ===================== 📬 Gmail Functions ======================
+def fetch_unread_emails(service):
+    result = service.users().messages().list(userId='me', labelIds=['INBOX'], q="is:unread").execute()
+    messages = result.get('messages', [])
+    emails = []
+
+    for msg in messages[:5]:
+        msg_id = msg['id']
+        full_msg = service.users().messages().get(userId='me', id=msg_id, format='full').execute()
+        headers = full_msg['payload'].get('headers', [])
+        subject = sender = ""
+        for h in headers:
+            if h['name'] == 'From':
+                sender = h['value']
+            elif h['name'] == 'Subject':
+                subject = h['value']
+
+        body = ""
+        payload = full_msg['payload']
+        if 'parts' in payload:
+            for part in payload['parts']:
+                if part.get('mimeType') == 'text/plain':
+                    data = part['body'].get('data')
+                    if data:
+                        body = base64.urlsafe_b64decode(data).decode()
+                        break
+        else:
+            data = payload.get('body', {}).get('data')
+            if data:
+                body = base64.urlsafe_b64decode(data).decode()
+
+        emails.append((msg_id, sender, subject, body, full_msg.get('threadId')))
+    return emails
+
+def send_gmail_reply(service, to, thread_id, body):
+    message = MIMEText(body)
+    message['to'] = to
+    message['subject'] = "Re: Automated Reply"
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+    return service.users().messages().send(userId='me', body={
+        'raw': raw,
+        'threadId': thread_id
+    }).execute()
+
+def mark_as_processed(service, msg_id):
+    try:
+        service.users().messages().modify(userId='me', id=msg_id, body={
+            'removeLabelIds': ['INBOX']
+        }).execute()
+    except Exception as e:
+        print(f"⚠️ Failed to mark as processed: {e}")
+
+# ===================== 🌐 Gradio UI ======================
+gmail_service = None
+emails_cache = []
+
+def login():
+    global gmail_service
+    gmail_service = authenticate_gmail()
+    return "✅ Logged in successfully!"
+
+def fetch():
+    global emails_cache
+    if not gmail_service:
+        return "❌ Please log in first", []
+    emails_cache = fetch_unread_emails(gmail_service)
+    display_list = [f"{i+1}. From: {e[1]} | Subject: {e[2]}" for i, e in enumerate(emails_cache)]
+    return "📬 Fetched emails!", display_list
+
+def reply(index, custom_prompt):
+    try:
+        i = int(index) - 1
+        msg_id, sender, subject, body, thread_id = emails_cache[i]
+        prompt = custom_prompt.strip() if custom_prompt.strip() else body
+        reply_text = generate_gpt_reply(prompt)
+        send_gmail_reply(gmail_service, sender, thread_id, reply_text)
+        mark_as_processed(gmail_service, msg_id)
+        return f"✅ Reply sent to {sender}!\n\n✉️ GPT Reply:\n{reply_text}"
+    except Exception as e:
+        return f"❌ Error: {str(e)}"
+
+# ===================== 🚀 Launch App ======================
+with gr.Blocks() as app:
+    gr.Markdown("## 📧 Gmail Auto-Responder using GPT")
+    
+    login_btn = gr.Button("🔐 Login to Gmail")
+    login_status = gr.Textbox(label="Login Status")
+
+    fetch_btn = gr.Button("📬 Fetch Unread Emails")
+    email_list = gr.Textbox(label="Unread Emails", lines=10)
+
+    gr.Markdown("### ✍️ Reply to an Email")
+    email_index = gr.Textbox(label="Email Number (e.g., 1)")
+    custom_prompt = gr.Textbox(label="Custom Prompt (Optional)", placeholder="Leave empty to use email body")
+    reply_btn = gr.Button("📤 Generate & Send Reply")
+    reply_status = gr.Textbox(label="Reply Output", lines=8)
+
+    login_btn.click(fn=login, outputs=login_status)
+    fetch_btn.click(fn=fetch, outputs=[login_status, email_list])
+    reply_btn.click(fn=reply, inputs=[email_index, custom_prompt], outputs=reply_status)
+
+app.launch()
